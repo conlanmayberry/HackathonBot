@@ -1,20 +1,44 @@
 # HackathonBot
 
-Multi-agent AI system for building hackathon projects. Uses `claude-sonnet-4-6` via the Anthropic Python SDK.
+Multi-agent AI system for building hackathon projects. Every agent uses `claude-opus-4-8`
+via the Anthropic Python SDK, with **extended thinking** enabled so agents reason before
+producing code. All streaming goes through `agents/llm.py`.
 
 ## Architecture
 
-Orchestrator pattern: **Supervisor** delegates to specialist subagents in sequence.
+The **Planner** is the lead agent. It absorbs what used to be the Supervisor (orchestration)
+and Researcher (Devpost analysis), and additionally acts as the project **architect** and
+**integrator**. It drives the whole pipeline in sequence:
 
 ```
-Supervisor
-├── Planner        → generates 3-5 project ideas from Devpost winners
-├── Researcher     → finds similar projects on Devpost + GitHub
-├── Frontend Dev   → scaffolds frontend files to output/<slug>/frontend/
-├── Backend Dev    → scaffolds backend files to output/<slug>/backend/
-├── Debugger       → runs pylint/eslint on generated code
-└── Tester         → writes and runs pytest tests
+Planner
+  1. Research past winners on Devpost + generate 3-5 ideas (waits for user selection)
+  2. Kickoff chat (interactive runs only): asks the user a few clarifying questions
+     in the Chat tab; the answer is folded into the build instructions. Non-blocking
+     (proceeds with best judgment on timeout).
+  3. Architect a shared BUILD SPEC — API contract, data models, file manifest,
+     env vars, ports. Every downstream agent builds against this one contract.
+  4. Frontend Dev + Backend Dev run in parallel, both fed the same spec
+       → output/<slug>/frontend/  and  output/<slug>/backend/
+  5. Integrate — write root glue files so it runs as ONE app:
+       README.md, .env.example, .gitignore, run.sh, run.ps1
+  6. QA + fix loop — one QA agent reconciles requirements.txt against actual imports,
+     writes tests/conftest.py + suite, then runs pylint + pytest + a frontend-asset
+     check. On failure it hands the REAL errors back to the relevant dev
+     (backend_dev.repair / frontend_dev.repair) and re-verifies. Capped at
+     MAX_FIX_ROUNDS (2).
 ```
+
+Key reliability rules: dev output uses a large `max_tokens` budget (so multi-file output
+is never truncated → no missing files); the frontend and backend share one spec (so the
+API contract matches); QA reconciles `requirements.txt` against actual imports (so
+`pip install` is complete) and loops fixes through the devs until pylint+pytest pass; the
+root README + run scripts give one clear install path.
+
+Interactive chat: the planner can message the user mid-build via `ask_user` (wired in
+`main.py` → job `chat_event`/`awaiting_chat`); `/api/chat/{job_id}` routes a reply to a
+waiting planner, otherwise falls back to the standalone chat assistant (`agents/chat.py`).
+Agent→user messages are emitted as `{"type":"chat"}` events the UI renders in the Chat tab.
 
 ## Running
 

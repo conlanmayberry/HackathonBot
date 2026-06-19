@@ -68,6 +68,10 @@ async def start_job(req: StartRequest, background_tasks: BackgroundTasks):
         "chosen_idea_index": None,
         "custom_idea": None,
         "action": "build",
+        # In-build chat: lets the planner ask the user questions mid-run.
+        "chat_event": asyncio.Event(),
+        "awaiting_chat": False,
+        "chat_answer": None,
     }
     background_tasks.add_task(_run_job, job_id, req)
     return {"job_id": job_id}
@@ -87,7 +91,7 @@ async def stream_job(job_id: str):
                 yield f"data: {json.dumps(events[sent])}\n\n"
                 sent += 1
             if job.get("done"):
-                yield 'data: {"type":"status","agent":"supervisor","message":"__done__","data":{}}\n\n'
+                yield 'data: {"type":"status","agent":"planner","message":"__done__","data":{}}\n\n'
                 break
             await asyncio.sleep(0.3)
 
@@ -104,7 +108,7 @@ async def get_result(job_id: str):
 
 @app.post("/api/select-idea/{job_id}")
 async def select_idea(job_id: str, payload: dict):
-    """Unpause the supervisor: build a chosen/custom idea, or regenerate."""
+    """Unpause the planner: build a chosen/custom idea, or regenerate."""
     job = _jobs.get(job_id)
     if not job:
         return {"ok": False, "error": "Job not found"}
@@ -131,6 +135,17 @@ async def chat(job_id: str, req: ChatRequest):
     if not job:
         return {"error": "Job not found. Launch a project first."}
     history = job.setdefault("chat", [])
+
+    # If the planner is mid-build waiting on the user, deliver this message to it
+    # instead of generating a standalone assistant reply.
+    if job.get("awaiting_chat"):
+        history.append({"role": "user", "content": req.message})
+        job["chat_answer"] = req.message
+        ev = job.get("chat_event")
+        if ev:
+            ev.set()
+        return {"reply": "Got it — I'll factor that into the build. 👍"}
+
     reply = await chat_reply(job, history, req.message)
     history.append({"role": "user", "content": req.message})
     history.append({"role": "assistant", "content": reply})
@@ -181,7 +196,7 @@ def _cleanup():
 
 # ── Background worker ───────────────────────────────────────────────────────
 async def _run_job(job_id: str, req: StartRequest):
-    supervisor = SupervisorAgent()
+    planner = PlannerAgent()
     job = _jobs[job_id]
     events = job["events"]
     last_result = {}
@@ -196,14 +211,31 @@ async def _run_job(job_id: str, req: StartRequest):
             "custom_idea": job.get("custom_idea"),
         }
 
+    async def ask_user(question: str, timeout: float = 240.0):
+        """Post a question from the planner into the Chat tab and wait (bounded) for
+        a reply. Returns the user's text, or None if they don't answer in time."""
+        job["chat"].append({"role": "assistant", "content": question})
+        events.append({"type": "chat", "agent": "planner", "role": "assistant", "message": question})
+        job["chat_answer"] = None
+        job["chat_event"].clear()
+        job["awaiting_chat"] = True
+        try:
+            await asyncio.wait_for(job["chat_event"].wait(), timeout=timeout)
+            return job.get("chat_answer")
+        except asyncio.TimeoutError:
+            return None
+        finally:
+            job["awaiting_chat"] = False
+
     try:
-        async for event in supervisor.run(
+        async for event in planner.run(
             hackathon=req.hackathon,
             university=req.university,
             theme=req.theme,
             autonomous=req.autonomous,
             instructions=req.instructions,
             select_idea=wait_for_selection,
+            ask_user=ask_user,
         ):
             events.append(event)
             if event.get("data", {}).get("result"):
@@ -213,7 +245,7 @@ async def _run_job(job_id: str, req: StartRequest):
         traceback.print_exc()
         events.append({
             "type": "status",
-            "agent": "supervisor",
+            "agent": "planner",
             "message": f"❌ The run stopped due to an error: {type(e).__name__}: {e}",
             "data": {"error": str(e)},
         })

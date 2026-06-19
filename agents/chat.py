@@ -28,9 +28,17 @@ def _build_context(job: dict) -> str:
         parts.append(f"Selected idea: {selected.get('title')} — {selected.get('description', '')}")
         parts.append(f"Tech stack: {', '.join(selected.get('tech_stack', []))}")
 
-    research = result.get("research", {})
-    if research.get("report"):
-        parts.append(f"Research summary:\n{research['report'][:1200]}")
+    spec = result.get("build_spec", {})
+    if isinstance(spec, dict) and spec.get("summary"):
+        parts.append(f"Build spec summary: {spec['summary']}")
+    endpoints = spec.get("api_endpoints") if isinstance(spec, dict) else None
+    if endpoints:
+        ep = ", ".join(f"{e.get('method')} {e.get('path')}" for e in endpoints[:12])
+        parts.append(f"API endpoints: {ep}")
+
+    run = result.get("run", {})
+    if run:
+        parts.append(f"Run: backend on port {run.get('backend_port')}, frontend on port {run.get('frontend_port')}.")
 
     files = result.get("all_files", [])
     if files:
