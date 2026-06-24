@@ -1,5 +1,5 @@
 from typing import AsyncGenerator
-from agents.llm import stream, MODEL
+from agents.llm import stream, MODEL_CODE
 from tools.file_writer import write_file_blocks, get_output_path, list_output_files
 
 SYSTEM = (
@@ -73,6 +73,15 @@ Think carefully first, then produce every file. Requirements:
      list of every endpoint with an example curl. Use in-memory storage if a database
      would be overkill (and say so in the README).
 
+7. CLOSE YOUR DEPENDENCY GRAPH before you finish. The frontend will call the endpoints
+   in the spec's API contract EXACTLY as written — implement every one of them with the
+   matching path, method, and response shape. A frontend call to a route you didn't
+   create is a broken product. Likewise: every module you `import` resolves to the
+   standard library, a package in requirements.txt, or a file you also output here.
+
+8. FAIL LOUD, NOT SILENT. Return clear error responses (correct status codes + a JSON
+   body) rather than letting a handler raise an unhandled 500. Validate at the boundary.
+
 Output format — emit each file as a block, with NOTHING between blocks:
 ===FILE: main.py===
 <full file contents>
@@ -88,7 +97,7 @@ inside a ===FILE: ...=== block)."""
 
         full_text = ""
         async for kind, delta in stream(
-            model=MODEL,
+            model=MODEL_CODE,
             max_tokens=32000,
             thinking=True,
             effort="high",
@@ -139,7 +148,7 @@ Only re-output files you actually change. Output ONLY file blocks."""
 
         full_text = ""
         async for kind, delta in stream(
-            model=MODEL, max_tokens=24000, thinking=True, effort="high", system=SYSTEM,
+            model=MODEL_CODE, max_tokens=24000, thinking=True, effort="high", system=SYSTEM,
             messages=[{"role": "user", "content": prompt}],
         ):
             if kind == "text":

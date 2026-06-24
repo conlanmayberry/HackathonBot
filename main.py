@@ -16,6 +16,7 @@ from agents.chat import chat_reply
 from tools.hackathon_search import search_hackathons
 from tools.github_upload import push_to_github
 from tools.runner import run_manager, preset_commands
+from tools.file_writer import save_job_meta, load_job_meta, latest_project, list_output_files, get_output_path
 
 app = FastAPI(title="HackathonBot")
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -35,6 +36,7 @@ class StartRequest(BaseModel):
 
 class ChatRequest(BaseModel):
     message: str
+    project_title: str = ""
 
 
 class PushRequest(BaseModel):
@@ -47,6 +49,12 @@ class RunRequest(BaseModel):
     project_title: str
     command: str
     subdir: str = ""
+
+
+class SaveFileRequest(BaseModel):
+    project_title: str
+    relative_path: str
+    content: str
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -133,7 +141,13 @@ async def find_hackathons(query: str = "", status: str = None):
 async def chat(job_id: str, req: ChatRequest):
     job = _jobs.get(job_id)
     if not job:
-        return {"error": "Job not found. Launch a project first."}
+        # The in-memory job is gone (server reloaded/restarted). Reconstruct it from
+        # disk so the user can keep talking to the team and edit the finished project.
+        job = _reconstruct_job(req.project_title)
+        if not job:
+            return {"reply": "I couldn't find a generated project to work on yet. "
+                             "Launch a build first, then I can chat about it and edit the files."}
+        _jobs[job_id] = job  # cache it so this chat session keeps its history
     history = job.setdefault("chat", [])
 
     # If the planner is mid-build waiting on the user, deliver this message to it
@@ -189,9 +203,67 @@ async def run_stop(run_id: str):
     return run_manager.stop(run_id)
 
 
+@app.get("/api/read-file")
+async def read_file_endpoint(project_title: str, path: str):
+    if not project_title or not path:
+        return {"ok": False, "error": "Missing parameters."}
+    try:
+        base = get_output_path(project_title).resolve()
+        target = (base / path).resolve()
+        if not str(target).startswith(str(base)):
+            return {"ok": False, "error": "Invalid path."}
+        if not target.exists():
+            return {"ok": False, "error": "File not found."}
+        return {"ok": True, "content": target.read_text(encoding="utf-8", errors="replace")}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.post("/api/save-file")
+async def save_file_endpoint(req: SaveFileRequest):
+    if not req.project_title or not req.relative_path:
+        return {"ok": False, "error": "Missing parameters."}
+    try:
+        base = get_output_path(req.project_title).resolve()
+        target = (base / req.relative_path).resolve()
+        if not str(target).startswith(str(base)):
+            return {"ok": False, "error": "Invalid path."}
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(req.content, encoding="utf-8")
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 @app.on_event("shutdown")
 def _cleanup():
     run_manager.stop_all()
+
+
+def _reconstruct_job(project_title: str = "") -> dict | None:
+    """Rebuild a minimal job from disk after the in-memory store was cleared (server
+    reload/restart). Tries the title the frontend sent, then the most recent build.
+    Returns a job dict shaped like a live one (request + result + chat), or None if
+    there's genuinely nothing on disk to talk about."""
+    meta = load_job_meta(project_title) if project_title else None
+    if meta is None:
+        slug = latest_project()
+        if slug is None:
+            return None
+        meta = load_job_meta(slug)
+        if meta is None:
+            # Folder exists but no saved metadata — synthesize the minimum chat needs.
+            files = list_output_files(slug)
+            if not files:
+                return None
+            meta = {"request": {}, "result": {"selected_idea": {"title": slug}, "all_files": files}}
+
+    return {
+        "request": meta.get("request", {}),
+        "result": meta.get("result", {}),
+        "chat": [],
+        "awaiting_chat": False,  # the live planner is gone; route to the editing assistant
+    }
 
 
 # ── Background worker ───────────────────────────────────────────────────────
@@ -252,3 +324,7 @@ async def _run_job(job_id: str, req: StartRequest):
     finally:
         job["done"] = True
         job["result"] = last_result
+        # Persist so chat survives a server reload and can edit the finished project.
+        title = (last_result.get("selected_idea") or {}).get("title")
+        if title:
+            save_job_meta(title, {"request": job.get("request", {}), "result": last_result})

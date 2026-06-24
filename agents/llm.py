@@ -28,8 +28,16 @@ claude-opus-4-8 specifics (do NOT regress these — each is a 400 otherwise):
 import os
 import anthropic
 
-# The single most capable Claude model — every agent uses it (per project spec).
+# Two tiers, picked per task to balance quality against cost:
+#   MODEL      — the architect's brain. Opus 4.8 for the high-stakes reasoning where a
+#                wrong call cascades through the whole build: Devpost research + idea
+#                generation, and the build-spec/architecture step the entire team builds against.
+#   MODEL_CODE — the builders' hands. Sonnet 4.6 is a top-tier coding model at ~40% lower
+#                cost ($3/$15 vs $5/$25 per 1M in/out); used for the well-scoped work that
+#                builds against a clear spec: frontend/backend dev, QA tests, README glue,
+#                and the interactive chat editor. It accepts the identical thinking API.
 MODEL = "claude-opus-4-8"
+MODEL_CODE = "claude-sonnet-4-6"
 
 _client: anthropic.AsyncAnthropic | None = None
 

@@ -15,11 +15,12 @@ QA never edits the application code itself — fixing is the devs' job.
 import re
 import ast
 import sys
+import hashlib
 import asyncio
 import subprocess
 from typing import AsyncGenerator
 
-from agents.llm import stream, MODEL
+from agents.llm import stream, MODEL_CODE
 from tools.file_writer import get_output_path, list_output_files, write_file
 
 # import-name -> PyPI package name, for the cases where they differ.
@@ -102,9 +103,11 @@ Write a complete test file. Hard requirements:
 
 Return ONLY the Python test file contents — no markdown fences, no prose."""
 
+        # Writing a TestClient suite against code that's already in front of the model is
+        # well-scoped work — Sonnet 4.6 at medium effort does it reliably for ~40% less.
         full_text = ""
         async for kind, delta in stream(
-            model=MODEL, max_tokens=16000, thinking=True, effort="high",
+            model=MODEL_CODE, max_tokens=16000, thinking=True, effort="medium",
             messages=[{"role": "user", "content": prompt}],
         ):
             if kind == "text":
@@ -126,16 +129,40 @@ Return ONLY the Python test file contents — no markdown fences, no prose."""
         if deps_added:
             yield _status("qa", f"Reconciled requirements.txt (+{', '.join(deps_added)})")
 
-        yield _status("qa", "Running pylint + pytest + frontend asset check…")
+        yield _status("qa", "Verifying: pylint + pytest + the integration graph (assets, JS imports, API contract)…")
         pylint_output = await _run_pylint(output_path, py_files)
         pytest_code, pytest_output = await _run_pytest(output_path)
-        missing_assets = _check_frontend_assets(output_path / "frontend")
+
+        # ── Integration checks: the failure class unit tests never catch — one
+        # agent referencing an artifact another agent never produced. ──────────
+        frontend_dir = output_path / "frontend"
+        missing_assets = _check_frontend_assets(frontend_dir)      # HTML → css/js/asset refs
+        broken_imports = _check_js_imports(frontend_dir)           # JS  → ES-module imports
+        contract_gaps = _check_api_contract(output_path)           # frontend fetch ↔ backend routes
 
         pylint_errors = re.findall(r":\s*([EF]\d{4}):", pylint_output)
         # pytest exit codes: 0 = all passed, 5 = no tests collected, None = unavailable.
         pytest_ok = pytest_code in (0, None)
-        frontend_ok = not missing_assets
-        passed = pytest_ok and not pylint_errors and frontend_ok
+        frontend_ok = not (missing_assets or broken_imports)
+        contract_ok = not contract_gaps
+        static_clean = pytest_ok and not pylint_errors and frontend_ok and contract_ok
+
+        # ── Runtime browser check: launch the real app and assert the page renders ──
+        # This is the slowest, most expensive check by far (pip install + two servers + a
+        # headless browser), so only run it once the cheap static checks are clean. If
+        # pylint/pytest or the integration graph already failed, those failures route to the
+        # devs and we re-verify next round anyway — and a build with a broken import or a
+        # missing route won't render in a browser regardless. Skipping here saves a full
+        # install+launch cycle on every failing round of the fix loop.
+        runtime_skipped = not static_clean
+        if static_clean:
+            yield _status("qa", "Static checks clean — runtime browser check: starting app and loading in headless Chromium…")
+            runtime_problems = await _check_runtime(output_path)
+        else:
+            yield _status("qa", "Skipping the runtime browser check until pylint/pytest/integration checks are clean.")
+            runtime_problems = []
+        runtime_ok = not runtime_problems
+        passed = static_clean and runtime_ok
 
         backend_failures = ""
         if pylint_errors or (pytest_code not in (0, 5, None)):
@@ -144,19 +171,45 @@ Return ONLY the Python test file contents — no markdown fences, no prose."""
                 ("pylint errors:\n" + "\n".join(err_lines) + "\n\n" if err_lines else "")
                 + ("pytest output:\n" + pytest_output[-2500:] if pytest_code not in (0, 5, None) else "")
             ).strip()
-
-        frontend_failures = ""
-        if missing_assets:
-            frontend_failures = (
-                "index.html references these local files that DO NOT EXIST in frontend/. "
-                "Create them (or stop referencing them): " + ", ".join(missing_assets)
+        if contract_gaps:
+            # The frontend calls endpoints the backend doesn't serve. Per the build
+            # spec the backend owns the contract, so route the fix there.
+            gap_lines = "\n".join(f"- frontend calls `{m} {p}` but no backend route matches it" for m, p in contract_gaps)
+            backend_failures = (backend_failures + "\n\n" if backend_failures else "") + (
+                "API CONTRACT GAP — the frontend calls these endpoints that the backend does NOT "
+                "implement. Add the missing routes (matching the build spec's contract), or if the "
+                "frontend is calling the wrong path, the path it expects is shown:\n" + gap_lines
             )
 
+        frontend_failures = ""
+        fe_problems = []
+        if missing_assets:
+            fe_problems.append(
+                "HTML references these local files that DO NOT EXIST — create them (or stop "
+                "referencing them): " + ", ".join(missing_assets))
+        if broken_imports:
+            fe_problems.append(
+                "These JS module imports do NOT resolve to a file on disk — a single failed top-level "
+                "import takes down the whole script, so the page never boots. Create the missing files "
+                "(or fix the paths):\n" + "\n".join(f"- {i}" for i in broken_imports))
+        if runtime_problems:
+            fe_problems.append(
+                "RUNTIME CHECK FAILED — the app was launched and loaded in a real browser but these "
+                "problems were detected. Fix the rendering or server startup issues:\n"
+                + "\n".join(f"- {p}" for p in runtime_problems))
+        if fe_problems:
+            frontend_failures = "\n\n".join(fe_problems)
+
         # Human-readable summary for the Debug/Tests panel.
-        summary = []
-        summary.append("✅ pytest passed" if pytest_ok else f"❌ pytest failed (exit {pytest_code})")
-        summary.append("✅ no pylint errors" if not pylint_errors else f"❌ {len(pylint_errors)} pylint error(s)")
-        summary.append("✅ frontend assets present" if frontend_ok else f"❌ missing frontend files: {', '.join(missing_assets)}")
+        summary = [
+            "✅ pytest passed" if pytest_ok else f"❌ pytest failed (exit {pytest_code})",
+            "✅ no pylint errors" if not pylint_errors else f"❌ {len(pylint_errors)} pylint error(s)",
+            "✅ frontend assets resolve" if not missing_assets else f"❌ missing assets: {', '.join(missing_assets)}",
+            "✅ JS imports resolve" if not broken_imports else f"❌ {len(broken_imports)} unresolved JS import(s)",
+            "✅ frontend↔backend API contract aligns" if contract_ok else f"❌ {len(contract_gaps)} API contract gap(s)",
+            "⏭️ runtime browser check skipped (clear the checks above first)" if runtime_skipped
+            else ("✅ runtime browser check passed" if runtime_ok else f"❌ {len(runtime_problems)} runtime problem(s)"),
+        ]
         issues = "## QA results\n" + "\n".join(f"- {s}" for s in summary)
 
         yield _data("qa", {
@@ -166,6 +219,7 @@ Return ONLY the Python test file contents — no markdown fences, no prose."""
             "pytest_output": pytest_output,
             "backend_failures": backend_failures,
             "frontend_failures": frontend_failures,
+            "runtime_problems": runtime_problems,
             "files_checked": len(py_files),
             "deps_added": deps_added,
         })
@@ -275,6 +329,294 @@ def _check_frontend_assets(frontend_dir) -> list[str]:
         if clean.lower().endswith((".css", ".js")) and not (frontend_dir / clean).exists():
             missing.append(ref)
     return missing
+
+
+def _check_js_imports(frontend_dir) -> list[str]:
+    """Resolve every relative ES-module import in the frontend's JS and report the
+    ones that don't point at a real file. A single failed top-level import silently
+    bricks the whole page, so this is one of the highest-value integration checks."""
+    if not frontend_dir.exists():
+        return []
+    js_files = [p for p in frontend_dir.rglob("*.js") if p.is_file()]
+    # static `import ... from '<path>'`, side-effect `import '<path>'`, re-export
+    # `export ... from '<path>'`, and dynamic `import('<path>')`.
+    pat = re.compile(
+        r"""(?:import|export)\s+(?:[^'"]*?\sfrom\s+)?['"]([^'"]+)['"]"""
+        r"""|import\s*\(\s*['"]([^'"]+)['"]\s*\)"""
+    )
+    problems = []
+    for js in js_files:
+        try:
+            src = js.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for m in pat.finditer(src):
+            spec = (m.group(1) or m.group(2) or "").strip()
+            # Only verify local/relative specifiers (bare specifiers are CDN/package imports).
+            if not spec.startswith((".", "/")):
+                continue
+            spec_clean = spec.split("?")[0].split("#")[0]
+            base = (js.parent / spec_clean).resolve()
+            candidates = [base]
+            if not base.suffix:  # extensionless import → try .js and /index.js
+                candidates += [base.with_suffix(".js"), base / "index.js"]
+            if not any(c.exists() for c in candidates):
+                rel = js.relative_to(frontend_dir).as_posix()
+                problems.append(f"{rel} imports '{spec}' which does not exist")
+    return problems
+
+
+# Methods we look for on both sides of the contract.
+_HTTP_METHODS = ("get", "post", "put", "patch", "delete")
+
+
+def _check_api_contract(output_path) -> list[tuple[str, str]]:
+    """Cross-check the frontend's HTTP calls against the backend's routes.
+
+    Returns (method, path) pairs the frontend calls that no backend route serves.
+    Conservative by design — only flags calls whose path is statically determinable,
+    so dynamic/templated URLs never produce false positives that thrash the fix loop."""
+    backend = output_path / "backend"
+    frontend = output_path / "frontend"
+    if not backend.exists() or not frontend.exists():
+        return []
+
+    backend_routes = _backend_routes(backend)
+    if not backend_routes:
+        return []  # can't extract routes → don't guess
+    backend_norm = {(meth, _norm_path(path)) for meth, path in backend_routes}
+    backend_norm_paths = {p for _, p in backend_norm}
+
+    gaps = []
+    seen = set()
+    for js in [p for p in frontend.rglob("*.js") if p.is_file()]:
+        try:
+            src = js.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for meth, path in _frontend_calls(src):
+            # Skip calls to external services — only our own backend is the contract.
+            if re.match(r"https?://", path) and not re.match(r"https?://(127\.0\.0\.1|localhost)", path):
+                continue
+            norm = _norm_path(path)
+            if not norm.startswith("/"):
+                continue
+            segs = [s for s in norm.split("/") if s]
+            if segs and segs[0] == "{}":
+                continue  # dynamic first segment — can't anchor a comparison, skip (no false positives)
+            key = (meth, norm)
+            if key in seen:
+                continue
+            seen.add(key)
+            if norm not in backend_norm_paths:
+                gaps.append((meth.upper() if meth != "?" else "GET?", path))
+    return gaps
+
+
+def _backend_routes(backend_dir) -> list[tuple[str, str]]:
+    routes = []
+    deco = re.compile(r"@\w+\.(" + "|".join(_HTTP_METHODS) + r")\s*\(\s*['\"]([^'\"]+)['\"]")
+    for py in backend_dir.rglob("*.py"):
+        try:
+            src = py.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for m in deco.finditer(src):
+            routes.append((m.group(1), m.group(2)))
+    return routes
+
+
+def _frontend_calls(src: str) -> list[tuple[str, str]]:
+    """Extract (method, path) pairs from fetch()/axios calls with a statically
+    determinable path. Conservative: template literals are kept only when a leading
+    base-url/origin can be stripped to leave a path that starts with '/'."""
+    calls = []
+    # fetch('/x') / fetch("/x") — single/double-quoted static strings.
+    for m in re.finditer(r"""fetch\s*\(\s*(['"])([^'"]+)\1""", src):
+        calls.append(("?", m.group(2)))
+    # fetch(`...`) — template literal: strip a leading ${BASE}/origin, keep if path-rooted.
+    for m in re.finditer(r"fetch\s*\(\s*`([^`]+)`", src):
+        body = re.sub(r"^\$\{[^}]+\}", "", m.group(1))
+        body = re.sub(r"^https?://[^/]+", "", body)
+        if body.startswith("/"):
+            calls.append(("?", body))
+    # axios.get('/x'), api.post("/x"), client.delete('/x') — single/double-quoted.
+    for m in re.finditer(r"""\.(""" + "|".join(_HTTP_METHODS) + r""")\s*\(\s*(['"])([^'"]+)\2""", src):
+        calls.append((m.group(1), m.group(3)))
+    return calls
+
+
+def _norm_path(url: str) -> str:
+    """Reduce a URL to a comparable path template: strip origin/base, query, and
+    collapse path params (`/items/123`, `/items/${id}`, `/items/{id}`) to `/items/{}`."""
+    u = url.strip()
+    # Strip a leading origin (http://host:port) if present.
+    u = re.sub(r"^https?://[^/]+", "", u)
+    # Strip a known base-url variable prefix like ${API_BASE} left at the head.
+    u = re.sub(r"^\$\{[^}]+\}", "", u)
+    u = u.split("?")[0].split("#")[0]
+    if not u.startswith("/"):
+        u = "/" + u if u and not u.startswith("$") else u
+    # Collapse dynamic / param segments to a single placeholder.
+    segs = []
+    for seg in u.split("/"):
+        if not seg:
+            segs.append(seg)
+            continue
+        if seg.startswith(("{", ":", "$")) or re.fullmatch(r"\d+", seg) or "${" in seg:
+            segs.append("{}")
+        else:
+            segs.append(seg)
+    norm = "/".join(segs)
+    return norm.rstrip("/") or "/"
+
+
+# Hashes of requirements.txt files we've already pip-installed successfully this process,
+# so the fix loop doesn't reinstall unchanged deps on every verify round.
+_INSTALLED_REQS: set[str] = set()
+
+
+async def _check_runtime(output_path, backend_port: int = 18100, frontend_port: int = 18200) -> list[str]:
+    """Launch the app in subprocesses, open index.html in headless Chromium, and assert the
+    page renders real content with no console errors and no failed API requests.
+    Returns a list of problem strings; empty = all clear.
+    Skips cleanly (returns []) when playwright is not installed or the project layout
+    doesn't have the expected backend/frontend dirs."""
+    try:
+        from playwright.async_api import async_playwright  # noqa: PLC0415
+    except ImportError:
+        return []
+
+    backend_dir = output_path / "backend"
+    frontend_dir = output_path / "frontend"
+    if not backend_dir.exists() or not (frontend_dir / "index.html").exists():
+        return []
+
+    # Locate the FastAPI entrypoint (main.py is the canonical name from the build spec).
+    main_module = next(
+        (stem for stem in ("main", "app", "server") if (backend_dir / f"{stem}.py").exists()),
+        None,
+    )
+    if not main_module:
+        return ["runtime: cannot find main.py / app.py / server.py in backend/"]
+
+    problems: list[str] = []
+    backend_proc = None
+    frontend_proc = None
+
+    try:
+        # Install backend deps so the server can actually start. The fix loop calls verify()
+        # several times; skip the (slow) reinstall when requirements.txt is byte-identical to
+        # a successful install we already did this process — but reinstall if QA changed it.
+        req = backend_dir / "requirements.txt"
+        if req.exists():
+            req_hash = hashlib.md5(req.read_bytes()).hexdigest()
+            if req_hash not in _INSTALLED_REQS:
+                pip = await asyncio.create_subprocess_exec(
+                    "python", "-m", "pip", "install", "-r", "requirements.txt", "-q",
+                    cwd=str(backend_dir),
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                try:
+                    await asyncio.wait_for(pip.wait(), timeout=120.0)
+                except asyncio.TimeoutError:
+                    pip.kill()
+                    return ["runtime: pip install timed out — deps not installed"]
+                if pip.returncode == 0:
+                    _INSTALLED_REQS.add(req_hash)  # only cache a clean install
+
+        # Launch backend.
+        backend_proc = await asyncio.create_subprocess_exec(
+            "python", "-m", "uvicorn", f"{main_module}:app",
+            "--host", "127.0.0.1", "--port", str(backend_port),
+            cwd=str(backend_dir),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+
+        # Launch frontend (simple static file server).
+        frontend_proc = await asyncio.create_subprocess_exec(
+            "python", "-m", "http.server", str(frontend_port),
+            cwd=str(frontend_dir),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+
+        # Poll until the backend is accepting connections (up to 15 s).
+        backend_ready = False
+        for _ in range(30):
+            await asyncio.sleep(0.5)
+            try:
+                _, writer = await asyncio.wait_for(
+                    asyncio.open_connection("127.0.0.1", backend_port), timeout=1.0
+                )
+                writer.close()
+                backend_ready = True
+                break
+            except Exception:
+                pass
+
+        if not backend_ready:
+            return [f"runtime: backend failed to start on port {backend_port} within 15 s"]
+
+        await asyncio.sleep(0.5)  # give frontend http.server a moment
+
+        # ── Headless browser smoke test ───────────────────────────────────────
+        console_errors: list[str] = []
+        failed_requests: list[str] = []
+
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(headless=True)
+            page = await browser.new_page()
+
+            page.on("console", lambda msg: console_errors.append(msg.text) if msg.type == "error" else None)
+            page.on("requestfailed", lambda req: failed_requests.append(f"FAILED {req.url}"))
+
+            async def _on_response(resp) -> None:
+                if resp.status >= 400 and f":{backend_port}" in resp.url:
+                    failed_requests.append(f"HTTP {resp.status} {resp.url}")
+            page.on("response", _on_response)
+
+            try:
+                await page.goto(
+                    f"http://127.0.0.1:{frontend_port}/index.html",
+                    wait_until="networkidle",
+                    timeout=20_000,
+                )
+            except Exception as exc:
+                await browser.close()
+                return [f"runtime: page failed to load — {exc}"]
+
+            body_text = (await page.inner_text("body")).strip()
+            await browser.close()
+
+        # Report browser console errors (cap at 5 to keep the repair prompt focused).
+        problems.extend(f"runtime: browser console error: {e}" for e in console_errors[:5])
+        problems.extend(f"runtime: {r}" for r in failed_requests[:5])
+
+        # Detect "stuck on loading" — body either empty or only contains a spinner.
+        loading_words = {"loading", "fetching", "please wait", "spinner"}
+        is_stuck = len(body_text) < 50 or any(w in body_text.lower() for w in loading_words)
+        if is_stuck:
+            preview = body_text[:200].replace("\n", " ")
+            problems.append(
+                f"runtime: page appears empty or stuck on a loading state — body preview: {preview!r}"
+            )
+
+        return problems
+
+    except Exception as exc:  # noqa: BLE001
+        return [f"runtime: browser check crashed unexpectedly — {exc}"]
+
+    finally:
+        for proc in (backend_proc, frontend_proc):
+            if proc and proc.returncode is None:
+                proc.kill()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=5.0)
+                except (asyncio.TimeoutError, Exception):
+                    pass
 
 
 def _strip_fence(code: str) -> str:

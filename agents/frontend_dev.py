@@ -1,5 +1,5 @@
 from typing import AsyncGenerator
-from agents.llm import stream, MODEL
+from agents.llm import stream, MODEL_CODE
 from tools.file_writer import write_file_blocks, get_output_path, list_output_files
 
 SYSTEM = (
@@ -59,6 +59,22 @@ Think carefully first, then produce every file. Requirements:
    thoughtful styling, responsive, with the project's actual features wired up — not
    a skeleton.
 
+5. CLOSE YOUR DEPENDENCY GRAPH before you finish. A passing look is not enough — the
+   #1 way these builds break is referencing something that was never created. Walk
+   every reference and confirm it resolves:
+   - Every <script src>, <link href>, <img src>, and other local asset in your HTML
+     is a file you also output in this response.
+   - Every ES-module `import ... from './x.js'` resolves to a file you also output.
+     A single failed top-level import silently bricks the entire page.
+   - Every fetch()/API call uses an exact path + method from the spec's API contract.
+   - If your code needs a file or endpoint you are NOT creating, that is a problem —
+     either create it here or call the right existing artifact. Do not reference a
+     file "someone will add later."
+
+6. FAIL LOUD, NOT SILENT. Prefer code where a missing/failed dependency shows a clear,
+   visible error over code that silently hangs. Resolve every loading state into real
+   content or an explicit error message — never leave the user staring at a spinner.
+
 Output format — emit each file as a block, with NOTHING between blocks:
 ===FILE: index.html===
 <full file contents>
@@ -73,7 +89,7 @@ inside a ===FILE: ...=== block)."""
 
         full_text = ""
         async for kind, delta in stream(
-            model=MODEL,
+            model=MODEL_CODE,
             max_tokens=32000,
             thinking=True,
             effort="high",
@@ -127,7 +143,7 @@ Output ONLY file blocks."""
 
         full_text = ""
         async for kind, delta in stream(
-            model=MODEL, max_tokens=24000, thinking=True, effort="high", system=SYSTEM,
+            model=MODEL_CODE, max_tokens=24000, thinking=True, effort="high", system=SYSTEM,
             messages=[{"role": "user", "content": prompt}],
         ):
             if kind == "text":

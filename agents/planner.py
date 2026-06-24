@@ -2,7 +2,7 @@ import json
 import asyncio
 from typing import AsyncGenerator
 
-from agents.llm import stream, MODEL
+from agents.llm import stream, MODEL, MODEL_CODE
 from tools.devpost import search_devpost_winners
 from tools.file_writer import list_output_files, get_output_path, write_file
 from agents.frontend_dev import FrontendDevAgent
@@ -157,6 +157,16 @@ class PlannerAgent:
                 async for event in _safe_stage(self.frontend_dev.repair(selected["title"], spec_text, qa_result["frontend_failures"]), "frontend_dev"):
                     yield event
 
+        # ── Step 7: INSTALL GUIDE — write the explicit setup instructions LAST, now that
+        #    requirements.txt is final (QA reconciled it during the fix loop). Covers the
+        #    system-level prerequisites the architect declared (game engine, runtimes, DB
+        #    servers, …) AND enumerates every backend package the "Install backend deps"
+        #    quick action installs, so the Files tab shows exactly what to set up. ───────
+        yield _status("planner", "Writing INSTALL.md — explicit setup steps (system prerequisites + every backend dependency)…")
+        install_guide = await self._write_install_guide(selected, spec, backend_port, frontend_port)
+        write_file(selected["title"], "INSTALL.md", install_guide)
+        yield _status("planner", "Wrote INSTALL.md — step-by-step install instructions are in the Files tab.", data={"files": ["INSTALL.md"]})
+
         # ── Final summary ───────────────────────────────────────────────────
         all_files = list_output_files(selected["title"])
         output_path = str(get_output_path(selected["title"]))
@@ -173,6 +183,7 @@ class PlannerAgent:
             "all_files": all_files,
             "output_path": output_path,
             "run": {"backend_port": backend_port, "frontend_port": frontend_port},
+            "install_guide": install_guide,
         }
 
         yield _status(
@@ -291,9 +302,10 @@ to build well without asking, return an empty array.
 
 Return ONLY a JSON array of question strings (e.g. ["Q1?", "Q2?"]). No prose."""
 
+        # Short, well-scoped clarifying questions — cheap boilerplate, runs on Sonnet.
         full_text = ""
         async for kind, delta in stream(
-            model=MODEL, max_tokens=800,
+            model=MODEL_CODE, max_tokens=800,
             messages=[{"role": "user", "content": prompt}],
         ):
             if kind == "text":
@@ -346,6 +358,7 @@ object (no markdown fences) with this shape:
   "slug": "kebab-case-name",
   "summary": "one-paragraph description of what gets built",
   "tech_stack": {{"frontend": ["..."], "backend": ["FastAPI", "..."]}},
+  "system_requirements": [{{"name": "Node.js", "version": "18+", "why": "what it's needed for", "install": "https://nodejs.org  (or `brew install node` / `winget install OpenJS.NodeJS`)"}}],
   "ports": {{"backend": {DEFAULT_BACKEND_PORT}, "frontend": {DEFAULT_FRONTEND_PORT}}},
   "env_vars": [{{"name": "ANTHROPIC_API_KEY", "description": "...", "required": true}}],
   "data_models": [{{"name": "Item", "fields": {{"id": "str", "name": "str"}}}}],
@@ -362,8 +375,25 @@ object (no markdown fences) with this shape:
   "backend_notes": "key logic, storage approach, any LLM usage (use Anthropic claude-opus-4-8 if needed)"
 }}
 
-Make api_endpoints concrete and complete — every feature the frontend needs must have an
-endpoint. Use realistic field names. If an LLM is needed, specify Anthropic (ANTHROPIC_API_KEY)."""
+CRITICAL — the manifest is the ownership contract that prevents integration gaps (the #1
+multi-agent failure: one agent references an artifact another agent never built):
+- The file_manifest must list EVERY file each side needs to run — including every JS
+  module that another file imports, every stylesheet/asset the HTML links, and every
+  backend module that main.py imports. If a file will be referenced anywhere, it MUST
+  appear in the manifest with an owner (its frontend/backend section). Nothing may be
+  referenced without an owner.
+- api_endpoints is the frontend↔backend contract: list EVERY endpoint the frontend will
+  call, concrete and complete. The frontend calls exactly these (path + method); the
+  backend implements exactly these. No feature may need an endpoint that isn't listed.
+- system_requirements lists EVERY non-pip, system-level prerequisite a developer must
+  install BY HAND before the app runs: game engines (Unity, Godot, Unreal), language
+  runtimes (Node.js, Go, .NET), database/cache servers (PostgreSQL, Redis, MongoDB), and
+  native CLI tools (ffmpeg, Docker, Tesseract, etc.) — each with a concrete version and
+  how to install it (a download link and/or package-manager commands for macOS/Windows/
+  Linux). Be specific: name the exact engine and edition the project assumes. Python
+  packages do NOT go here — they belong in requirements.txt. If the project is pure Python
+  plus a static HTML/CSS/JS frontend (no extra software needed), use an empty array [].
+Use realistic field names. If an LLM is needed, specify Anthropic (ANTHROPIC_API_KEY)."""
 
         full_text = ""
         async for kind, delta in stream(
@@ -454,15 +484,129 @@ Include, with real copy-pasteable commands:
 7. Troubleshooting: missing deps, missing API key, CORS, port already in use.
 
 Output GitHub-flavored markdown only."""
+        # README is glue prose generated from the finished spec — Sonnet handles it well.
         full_text = ""
         async for kind, delta in stream(
-            model=MODEL,
+            model=MODEL_CODE,
             max_tokens=4000,
             messages=[{"role": "user", "content": prompt}],
         ):
             if kind == "text":
                 full_text += delta
         return full_text.strip() or f"# {selected.get('title')}\n\n{selected.get('description', '')}\n"
+
+    async def _write_install_guide(self, selected, spec, backend_port, frontend_port) -> str:
+        """Explicit, project-specific setup instructions — saved as INSTALL.md and shown in
+        the Files tab. Covers (1) the system-level prerequisites the architect declared
+        (game engines, runtimes, DB servers, native tools) and (2) EVERY backend Python
+        package the '📦 Install backend deps' quick action installs, enumerated from the
+        FINAL requirements.txt (QA has reconciled it by the time this runs)."""
+        title = selected.get("title", "")
+        output_path = get_output_path(title)
+
+        # Deterministic: read the final requirements.txt so the dependency list is exactly
+        # what `pip install -r backend/requirements.txt` (the quick action) pulls in.
+        req_lines: list[str] = []
+        try:
+            for raw in (output_path / "backend" / "requirements.txt").read_text(encoding="utf-8").splitlines():
+                line = raw.strip()
+                if line and not line.startswith("#"):
+                    req_lines.append(line)
+        except OSError:
+            pass
+        reqs_block = "\n".join(req_lines) or "(no backend/requirements.txt found)"
+
+        sys_lines = []
+        for r in (spec.get("system_requirements") or []):
+            if isinstance(r, dict):
+                sys_lines.append(
+                    f"- {r.get('name', '?')} {r.get('version', '')} — {r.get('why', '')} "
+                    f"(install: {r.get('install', 'see official site')})"
+                )
+        sys_block = "\n".join(sys_lines) or "(none declared — pure Python + a static frontend)"
+        ts = spec.get("tech_stack", {})
+        tech_str = ", ".join((ts.get("frontend") or []) + (ts.get("backend") or [])) or "Python, FastAPI, HTML/CSS/JS"
+
+        prompt = f"""Write INSTALL.md — explicit, copy-pasteable setup instructions for this hackathon
+project. A teammate on a fresh machine must follow it top to bottom and end up with the app
+running. Be SPECIFIC and concrete — no vague "install the dependencies" hand-waving.
+
+PROJECT: {title}
+TECH STACK: {tech_str}
+
+SYSTEM PREREQUISITES the architect declared (non-pip software that must be installed by hand —
+game engines, runtimes, database servers, native CLI tools):
+{sys_block}
+
+EXACT contents of backend/requirements.txt (this is precisely what gets installed):
+{reqs_block}
+
+Repo layout: backend/ (FastAPI, port {backend_port}), frontend/ (static, port {frontend_port}),
+tests/ (pytest). There are run.sh / run.ps1 one-command scripts at the repo root too.
+
+Write the guide as GitHub-flavored markdown with these sections:
+
+1. "## 1. System prerequisites" — for EACH item above, a short sub-section giving the exact
+   version and the real install command(s) for macOS / Windows / Linux (or a download link).
+   Be concrete and name the exact engine/edition. If the list is empty, say plainly that the
+   only requirement is Python 3.10+ and no extra software is needed.
+2. "## 2. Python & backend dependencies" — create+activate a venv, then state that
+   `pip install -r backend/requirements.txt` installs the packages. IMPORTANT: say explicitly
+   that this is the SAME thing the "📦 Install backend deps" quick action in the app's Run tab
+   does, so the user knows the button and this command are identical. Then list EVERY package
+   from the requirements.txt above in a markdown table with two columns — Package and "What
+   it's for" — and wrap each package/version in backticks (e.g. `fastapi>=0.115.0`). Do not
+   omit any and do not invent any that aren't listed.
+3. "## 3. Configuration" — copy .env.example to .env and fill in keys (call out ANTHROPIC_API_KEY
+   if it appears in the deps/spec).
+4. "## 4. Run it" — exact commands to start the backend (uvicorn on port {backend_port}) and the
+   frontend (python -m http.server {frontend_port} from frontend/), plus the run.sh / run.ps1
+   one-liner alternative.
+5. "## 5. Verify it works" — open the frontend URL, and run `pytest tests -v`.
+
+Output ONLY the markdown for INSTALL.md (no fences around the whole thing)."""
+
+        full_text = ""
+        async for kind, delta in stream(
+            model=MODEL_CODE, max_tokens=4000,
+            messages=[{"role": "user", "content": prompt}],
+        ):
+            if kind == "text":
+                full_text += delta
+        return full_text.strip() or _fallback_install_md(title, sys_lines, req_lines, backend_port, frontend_port)
+
+
+def _fallback_install_md(title, sys_lines, req_lines, backend_port, frontend_port) -> str:
+    """Deterministic INSTALL.md if the model returns nothing — still accurate and complete."""
+    parts = [f"# Installing {title}", ""]
+    parts += ["## 1. System prerequisites", ""]
+    parts += sys_lines if sys_lines else ["- Python 3.10+ — no other system software is required."]
+    parts += [
+        "", "## 2. Python & backend dependencies", "",
+        "```bash",
+        "python -m venv .venv",
+        "# macOS/Linux: source .venv/bin/activate   |   Windows: .venv\\Scripts\\activate",
+        "pip install -r backend/requirements.txt",
+        "```",
+        "",
+        "This is exactly what the **📦 Install backend deps** quick action (Run tab) runs. "
+        "It installs:", "",
+    ]
+    parts += [f"- `{l}`" for l in req_lines] if req_lines else ["- (no backend/requirements.txt found)"]
+    parts += [
+        "", "## 3. Configuration", "",
+        "```bash", "cp .env.example .env   # then fill in any keys", "```",
+        "", "## 4. Run it", "",
+        "```bash",
+        f"# Backend (from backend/):  uvicorn main:app --host 127.0.0.1 --port {backend_port}",
+        f"# Frontend (from frontend/): python -m http.server {frontend_port}",
+        "# Or one command from the repo root:  ./run.sh   (Windows: ./run.ps1)",
+        "```",
+        "", "## 5. Verify it works", "",
+        f"- Open http://127.0.0.1:{frontend_port} in your browser.",
+        "- Run the tests: `pytest tests -v`.", "",
+    ]
+    return "\n".join(parts)
 
 
 # ── Spec formatting / parsing helpers ───────────────────────────────────────
@@ -483,6 +627,18 @@ def _format_spec(spec: dict, selected: dict) -> str:
             lines.append(f"- **Frontend:** {', '.join(ts['frontend'])}")
         if ts.get("backend"):
             lines.append(f"- **Backend:** {', '.join(ts['backend'])}")
+        lines.append("")
+
+    sysreqs = spec.get("system_requirements") or []
+    if sysreqs:
+        lines.append("## System prerequisites (install by hand before running)")
+        for r in sysreqs:
+            if not isinstance(r, dict):
+                continue
+            ver = f" {r.get('version')}" if r.get("version") else ""
+            why = f" — {r.get('why')}" if r.get("why") else ""
+            how = f"  \n  Install: {r.get('install')}" if r.get("install") else ""
+            lines.append(f"- **{r.get('name', '?')}**{ver}{why}{how}")
         lines.append("")
 
     ports = spec.get("ports", {})

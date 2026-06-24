@@ -1,8 +1,13 @@
 import re
+import json
 from pathlib import Path
 
 
 OUTPUT_DIR = Path("output")
+# Job metadata (build results) lives in a sibling of the project slugs so it survives a
+# server reload but is never part of any project's files / GitHub push. `.`-prefixed so
+# latest_project() skips it.
+META_DIR = OUTPUT_DIR / ".meta"
 
 # Directories and file patterns that are build/runtime artifacts, never project files.
 IGNORE_DIRS = {"__pycache__", ".pytest_cache", "node_modules", ".git", ".venv", "venv", ".mypy_cache", ".ruff_cache", "dist", "build", ".idea", ".vscode"}
@@ -49,6 +54,40 @@ def list_output_files(project_title: str) -> list[str]:
     """Relative paths of real project files for a project (no cache/build junk)."""
     base = get_output_path(project_title)
     return [str(p.relative_to(base)) for p in iter_project_files(base)]
+
+
+# ── Job metadata persistence (so chat survives a server reload) ───────────────
+def save_job_meta(project_title: str, data: dict) -> None:
+    """Persist a finished build's job data (request + result) to disk, keyed by slug,
+    so the chat assistant can keep working after the in-memory job is gone."""
+    try:
+        META_DIR.mkdir(parents=True, exist_ok=True)
+        path = META_DIR / f"{slugify(project_title)}.json"
+        path.write_text(json.dumps(data, default=str), encoding="utf-8")
+    except (OSError, TypeError, ValueError):
+        pass  # metadata is best-effort; never break a build over it
+
+
+def load_job_meta(project_title: str) -> dict | None:
+    """Load persisted job data for a project (by title or slug), or None."""
+    path = META_DIR / f"{slugify(project_title)}.json"
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def latest_project() -> str | None:
+    """Slug of the most recently modified project folder — the chat fallback when the
+    frontend doesn't know which project it's talking about (e.g. after a page reload)."""
+    if not OUTPUT_DIR.exists():
+        return None
+    dirs = [p for p in OUTPUT_DIR.iterdir() if p.is_dir() and not p.name.startswith(".")]
+    if not dirs:
+        return None
+    return max(dirs, key=lambda p: p.stat().st_mtime).name
 
 
 def parse_file_blocks(raw: str) -> list[tuple[str, str]]:
