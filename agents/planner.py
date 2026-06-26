@@ -89,6 +89,13 @@ class PlannerAgent:
         # ── Step 4: Frontend + Backend in parallel, both fed the same spec ──
         yield _status("planner", "Launching Frontend Dev and Backend Dev in parallel — both working from the shared spec…")
 
+        # The root README is written from the spec, which is already final — so kick it off
+        # NOW and let it generate concurrently with the (much longer) dev phase instead of
+        # serializing it afterwards. We await the result at the integration step below.
+        readme_task = asyncio.create_task(
+            self._write_root_readme(selected, spec_text, backend_port, frontend_port)
+        )
+
         q: asyncio.Queue = asyncio.Queue()
         fe_result: dict = {}
         be_result: dict = {}
@@ -125,7 +132,7 @@ class PlannerAgent:
 
         # ── Step 5: INTEGRATE — write the root-level glue files ─────────────
         yield _status("planner", "Writing root-level integration files (README, .env.example, .gitignore, run scripts)…")
-        glue_files = await self._write_integration_files(selected, spec, spec_text, backend_port, frontend_port)
+        glue_files = await self._write_integration_files(selected, spec, spec_text, backend_port, frontend_port, readme_task)
         yield _status("planner", f"Wrote {len(glue_files)} integration files so the project installs and runs as one app.", data={"files": glue_files})
 
         # ── Step 6: QA + fix loop (build → verify → devs fix → re-verify) ───
@@ -213,16 +220,19 @@ class PlannerAgent:
                     f"reword them. Produce clearly DIFFERENT concepts:\n{'; '.join(avoid)}"
                 )
 
-            prompt = f"""You are a hackathon strategist helping a college team win {hackathon} at {university}.
+            # Stable context (role, theme, winners research, team instructions) goes in the
+            # system prompt and is cached; only the volatile "avoid these" list changes
+            # between rounds, so a "regenerate" reuses the cached Opus prefix.
+            system_ctx = f"""You are a hackathon strategist helping a college team win {hackathon} at {university}.
 
 Theme/category: {theme}
 
 Past winning projects found on Devpost:
-{winners_text}{extra}{avoid_block}
+{winners_text}{extra}"""
 
-Generate 3-5 project ideas. About 60% should build on patterns you see in past winners,
-40% should be fresh/original. Each idea must be buildable in a hackathon as a web app
-(JS frontend + Python/FastAPI backend).
+            prompt = f"""Generate 3-5 project ideas for the team. About 60% should build on patterns
+you see in the past winners above, 40% should be fresh/original. Each idea must be buildable in a
+hackathon as a web app (JS frontend + Python/FastAPI backend).{avoid_block}
 
 For each idea return a JSON object with:
 - title: short project name
@@ -237,6 +247,8 @@ Return a JSON array of these objects. No markdown fences, just raw JSON."""
             async for kind, delta in stream(
                 model=MODEL,
                 max_tokens=4000,
+                system=system_ctx,
+                cache=True,
                 messages=[{"role": "user", "content": prompt}],
             ):
                 if kind == "text":
@@ -423,7 +435,7 @@ Use realistic field names. If an LLM is needed, specify Anthropic (ANTHROPIC_API
         yield {"__spec__": True, "spec": spec, "spec_text": _format_spec(spec, selected)}
 
     # ── Integration / glue files ────────────────────────────────────────────
-    async def _write_integration_files(self, selected, spec, spec_text, backend_port, frontend_port) -> list[str]:
+    async def _write_integration_files(self, selected, spec, spec_text, backend_port, frontend_port, readme_task=None) -> list[str]:
         title = selected["title"]
         written = []
 
@@ -450,8 +462,13 @@ Use realistic field names. If an LLM is needed, specify Anthropic (ANTHROPIC_API
         written.append(write_file(title, "run.sh", _run_sh(backend_port, frontend_port)))
         written.append(write_file(title, "run.ps1", _run_ps1(backend_port, frontend_port)))
 
-        # 4) Root README — LLM-written from the spec for a clear, accurate walkthrough.
-        readme = await self._write_root_readme(selected, spec_text, backend_port, frontend_port)
+        # 4) Root README — LLM-written from the spec. It was kicked off back when the dev
+        #    phase started (it only needs the spec), so by now it's usually already done;
+        #    await the in-flight task instead of generating it from scratch here.
+        if readme_task is not None:
+            readme = await readme_task
+        else:
+            readme = await self._write_root_readme(selected, spec_text, backend_port, frontend_port)
         written.append(write_file(title, "README.md", readme))
         return written
 
@@ -485,14 +502,20 @@ Include, with real copy-pasteable commands:
 
 Output GitHub-flavored markdown only."""
         # README is glue prose generated from the finished spec — Sonnet handles it well.
+        # Runs concurrently with the dev phase, so guard it: a transient API error here must
+        # degrade to a minimal README, never abort the build at the await point downstream.
         full_text = ""
-        async for kind, delta in stream(
-            model=MODEL_CODE,
-            max_tokens=4000,
-            messages=[{"role": "user", "content": prompt}],
-        ):
-            if kind == "text":
-                full_text += delta
+        try:
+            async for kind, delta in stream(
+                model=MODEL_CODE,
+                max_tokens=4000,
+                messages=[{"role": "user", "content": prompt}],
+            ):
+                if kind == "text":
+                    full_text += delta
+        except Exception:  # noqa: BLE001 — README is non-critical glue; fall back gracefully
+            import traceback
+            traceback.print_exc()
         return full_text.strip() or f"# {selected.get('title')}\n\n{selected.get('description', '')}\n"
 
     async def _write_install_guide(self, selected, spec, backend_port, frontend_port) -> str:

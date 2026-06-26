@@ -12,6 +12,19 @@ SYSTEM = (
 )
 
 
+def _system_with_spec(spec_text: str) -> str:
+    """Role + the FULL shared build spec, as one stable system prompt. Kept byte-identical
+    between run() and repair() so prompt caching reuses the cached prefix across both calls
+    (cheaper input, faster first token) — and so repair always sees the COMPLETE contract
+    (API base URL, exact endpoints) instead of a truncated slice."""
+    return (
+        f"{SYSTEM}\n\n"
+        "══════════ SHARED BUILD SPEC (the single source of truth for the whole team) ══════════\n"
+        f"{spec_text}\n"
+        "═══════════════════════════════════════════════════════════════════════════════════════"
+    )
+
+
 class FrontendDevAgent:
     async def run(
         self,
@@ -32,10 +45,8 @@ class FrontendDevAgent:
 PROJECT: {project_title}
 DESCRIPTION: {project_description}
 
-══════════ SHARED BUILD SPEC (the single source of truth for the whole team) ══════════
-{spec_text}
-═══════════════════════════════════════════════════════════════════════════════════════
-{extra}
+The shared BUILD SPEC — the single source of truth for the whole team — is in your system
+prompt above. Follow its API endpoints, base URL, and file manifest exactly.{extra}
 
 Think carefully first, then produce every file. Requirements:
 
@@ -93,7 +104,8 @@ inside a ===FILE: ...=== block)."""
             max_tokens=32000,
             thinking=True,
             effort="high",
-            system=SYSTEM,
+            system=_system_with_spec(spec_text),
+            cache=True,
             messages=[{"role": "user", "content": prompt}],
         ):
             if kind == "text":
@@ -121,12 +133,10 @@ inside a ===FILE: ...=== block)."""
         existing = "\n\n".join(snippets) or "No frontend files found."
 
         prompt = f"""You are the frontend engineer. QA found problems with the frontend.
+The full build spec (API contract / base URL) is in your system prompt above.
 
 QA failures:
 {failures[:3000]}
-
-Build spec (for the API contract / base URL):
-{spec_text[:2000]}
 
 Existing frontend files:
 {existing}
@@ -143,7 +153,8 @@ Output ONLY file blocks."""
 
         full_text = ""
         async for kind, delta in stream(
-            model=MODEL_CODE, max_tokens=24000, thinking=True, effort="high", system=SYSTEM,
+            model=MODEL_CODE, max_tokens=24000, thinking=True, effort="high",
+            system=_system_with_spec(spec_text), cache=True,
             messages=[{"role": "user", "content": prompt}],
         ):
             if kind == "text":

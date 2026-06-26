@@ -13,6 +13,19 @@ SYSTEM = (
 )
 
 
+def _system_with_spec(spec_text: str) -> str:
+    """Role + the FULL shared build spec, as one stable system prompt. Kept byte-identical
+    between run() and repair() so prompt caching reuses the cached prefix across both calls
+    (cheaper input, faster first token) — and so repair always sees the COMPLETE contract
+    instead of a truncated slice that could drop an endpoint."""
+    return (
+        f"{SYSTEM}\n\n"
+        "══════════ SHARED BUILD SPEC (the single source of truth for the whole team) ══════════\n"
+        f"{spec_text}\n"
+        "═══════════════════════════════════════════════════════════════════════════════════════"
+    )
+
+
 class BackendDevAgent:
     async def run(
         self,
@@ -33,10 +46,8 @@ class BackendDevAgent:
 PROJECT: {project_title}
 DESCRIPTION: {project_description}
 
-══════════ SHARED BUILD SPEC (the single source of truth for the whole team) ══════════
-{spec_text}
-═══════════════════════════════════════════════════════════════════════════════════════
-{extra}
+The shared BUILD SPEC — the single source of truth for the whole team — is in your system
+prompt above. Implement it exactly.{extra}
 
 Think carefully first, then produce every file. Requirements:
 
@@ -101,7 +112,8 @@ inside a ===FILE: ...=== block)."""
             max_tokens=32000,
             thinking=True,
             effort="high",
-            system=SYSTEM,
+            system=_system_with_spec(spec_text),
+            cache=True,
             messages=[{"role": "user", "content": prompt}],
         ):
             if kind == "text":
@@ -131,12 +143,10 @@ inside a ===FILE: ...=== block)."""
 
         prompt = f"""You are the backend engineer. QA ran pylint + pytest and found problems.
 Fix them so pylint has no errors and pytest passes. Make the SMALLEST changes that work.
+The full build spec (the contract you must keep matching) is in your system prompt above.
 
 QA failures:
 {failures[:4000]}
-
-The build spec (the contract you must keep matching):
-{spec_text[:2500]}
 
 Current files (paths are relative to the project root):
 {code_context}
@@ -148,7 +158,8 @@ Only re-output files you actually change. Output ONLY file blocks."""
 
         full_text = ""
         async for kind, delta in stream(
-            model=MODEL_CODE, max_tokens=24000, thinking=True, effort="high", system=SYSTEM,
+            model=MODEL_CODE, max_tokens=24000, thinking=True, effort="high",
+            system=_system_with_spec(spec_text), cache=True,
             messages=[{"role": "user", "content": prompt}],
         ):
             if kind == "text":
