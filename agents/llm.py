@@ -63,6 +63,7 @@ async def stream(
     system: str | None = None,
     thinking: bool = False,
     effort: str | None = None,
+    cache: bool = False,
 ):
     """Stream a completion, yielding ``(kind, delta)`` tuples.
 
@@ -72,6 +73,14 @@ async def stream(
 
     ``thinking=True`` enables adaptive thinking; ``effort`` (low|medium|high|xhigh|max)
     sets reasoning depth. ``temperature`` is intentionally unsupported (400 on this model).
+
+    ``cache=True`` marks the ``system`` prompt as a prompt-caching breakpoint
+    (``cache_control: ephemeral``). Put the large STABLE context (e.g. the shared build
+    spec) in ``system`` and the volatile, per-call task in ``messages``: the cached prefix
+    is then reused across calls within the cache TTL (e.g. a dev's run→repair), cutting
+    input cost and time-to-first-token. Caching only triggers above the model's minimum
+    cacheable prefix; below it the flag is a harmless no-op. Set ``LLM_DEBUG=1`` to log
+    cache hit/miss token counts to stderr.
     """
     kwargs: dict = {
         "model": model,
@@ -79,7 +88,12 @@ async def stream(
         "messages": messages,
     }
     if system:
-        kwargs["system"] = system
+        # When caching, send ``system`` as a content block carrying a cache breakpoint so
+        # everything up to and including it is cached; otherwise the plain string is fine.
+        kwargs["system"] = (
+            [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]
+            if cache else system
+        )
     if thinking:
         kwargs["thinking"] = {"type": "adaptive", "display": "summarized"}
     if effort:
@@ -95,3 +109,22 @@ async def stream(
                 yield ("thinking", delta.thinking)
             elif dtype == "text_delta":
                 yield ("text", delta.text)
+        if os.getenv("LLM_DEBUG"):
+            _log_cache_usage(model, await s.get_final_message())
+
+
+def _log_cache_usage(model: str, message) -> None:
+    """Print prompt-cache token accounting for one call (only when LLM_DEBUG is set).
+    ``cache_read_input_tokens`` > 0 means a cache hit; ``cache_creation_input_tokens``
+    is the prefix we just wrote (billed ~25% over base input, read back at ~10%)."""
+    import sys
+    u = getattr(message, "usage", None)
+    if u is None:
+        return
+    print(
+        f"[llm.cache] {model}: input={getattr(u, 'input_tokens', 0)} "
+        f"cache_write={getattr(u, 'cache_creation_input_tokens', 0)} "
+        f"cache_read={getattr(u, 'cache_read_input_tokens', 0)} "
+        f"output={getattr(u, 'output_tokens', 0)}",
+        file=sys.stderr,
+    )
