@@ -5,6 +5,7 @@ from typing import AsyncGenerator
 from agents.llm import stream, MODEL, MODEL_CODE
 from tools.devpost import search_devpost_winners
 from tools.file_writer import list_output_files, get_output_path, write_file
+from tools.memory import recall_relevant, summarize_lessons, record_build
 from agents.frontend_dev import FrontendDevAgent
 from agents.backend_dev import BackendDevAgent
 from agents.qa import QAAgent
@@ -73,9 +74,15 @@ class PlannerAgent:
                     yield item
 
         # ── Step 3: ARCHITECT — design the shared build spec ────────────────
+        # Recall lessons from similar past builds so the architect can pre-empt the
+        # failures that drove fix-loop rounds before (advisory only — empty if no history).
+        lessons = summarize_lessons(recall_relevant(theme, selected.get("tech_stack", [])))
+        if lessons:
+            yield _status("planner", "Recalling lessons from past builds to harden the spec…", data={"lessons": lessons})
+
         yield _status("planner", "Architecting the build spec — defining the API contract, file manifest, env vars and ports…")
         spec, spec_text = {}, ""
-        async for item in self._architect_spec(selected, instructions):
+        async for item in self._architect_spec(selected, instructions, lessons):
             if isinstance(item, dict) and item.get("__spec__"):
                 spec, spec_text = item["spec"], item["spec_text"]
             else:
@@ -163,6 +170,11 @@ class PlannerAgent:
             if qa_result.get("frontend_failures"):
                 async for event in _safe_stage(self.frontend_dev.repair(selected["title"], spec_text, qa_result["frontend_failures"]), "frontend_dev"):
                     yield event
+
+        # Remember this build's outcome (theme, stack, QA result, fix-round count) so future
+        # architect runs can recall it. ``attempt`` holds the rounds used; best-effort, never raises.
+        record_build(theme=theme, hackathon=hackathon, idea=selected, spec=spec,
+                     qa_result=qa_result, fix_rounds=attempt)
 
         # ── Step 7: INSTALL GUIDE — write the explicit setup instructions LAST, now that
         #    requirements.txt is final (QA reconciled it during the fix loop). Covers the
@@ -349,11 +361,16 @@ Return ONLY a JSON array of question strings (e.g. ["Q1?", "Q2?"]). No prose."""
             yield {"__instructions__": True, "instructions": instructions}
 
     # ── Architect the shared build spec ─────────────────────────────────────
-    async def _architect_spec(self, selected, instructions):
+    async def _architect_spec(self, selected, instructions, lessons=""):
         """Design the contract every agent builds against. Async generator: yields
-        live thought events, then a sentinel {"__spec__": True, "spec", "spec_text"}."""
+        live thought events, then a sentinel {"__spec__": True, "spec", "spec_text"}.
+        ``lessons`` (optional) is advisory text recalled from similar past builds."""
         tech = ", ".join(selected.get("tech_stack", []) or ["Python", "FastAPI", "JavaScript"])
         extra = f"\n\nAdditional team instructions to honor:\n{instructions}" if instructions else ""
+        lessons_block = (
+            f"\n\nLESSONS FROM PAST BUILDS (apply these to avoid repeating prior QA failures):\n{lessons}"
+            if lessons else ""
+        )
 
         prompt = f"""You are the technical architect for a hackathon team. Design the COMPLETE
 build spec for this project so a frontend dev and a backend dev can work in parallel and
@@ -361,7 +378,7 @@ have their pieces fit together perfectly on the first try.
 
 PROJECT: {selected.get('title')}
 DESCRIPTION: {selected.get('description', '')}
-SUGGESTED STACK: {tech}{extra}
+SUGGESTED STACK: {tech}{extra}{lessons_block}
 
 Think hard about the data model and the exact HTTP contract, then output ONLY a JSON
 object (no markdown fences) with this shape:
